@@ -65,6 +65,10 @@ local function parseWord(lineParser, regex)
   return result
 end
 
+local function startsWord(lineParser, regex)
+  return lineParser:peek(1):match(regex)
+end
+
 local function parseReg(lineParser)
   lineParser:skipWhitespace()
   local reg = lineParser:eat(1)
@@ -117,35 +121,47 @@ local operators = {
   ["+"] = {prec = 1, assoc = "left", fn = function(a, b) return a + b end},
   ["-"] = {prec = 1, assoc = "left", fn = function(a, b) return a - b end},
   ["*"] = {prec = 2, assoc = "left", fn = function(a, b) return a * b end},
-  ["/"] = {prec = 2, assoc = "left", fn = function(a, b) return a / b end},
+  ["/"] = {prec = 2, assoc = "left", fn = function(a, b) return a // b end},
 }
 
 local parseMath
-local function parseExpression(lineParser, ctx)
+local function parseExpression(lineParser)
   lineParser:skipWhitespace()
   if lineParser:peek(1) == "(" then
     lineParser:eat(1)
-    local result = parseMath(lineParser, ctx)
+    local result = parseMath(lineParser)
     lineParser:expect(")")
     return result
   elseif lineParser:peek(1) == "@" then
     lineParser:eat(1)
-    return ctx.relOffset
+    return function(ctx) return ctx.relOffset end
+  elseif startsWord(lineParser, "[a-zA-Z]") then
+    local word = parseWord(lineParser, "[a-zA-Z]")
+    return function(ctx)
+      local label = ctx.labels[word]
+      if not label and not ctx.firstParse then
+        error("Unknown label " .. word .. " at line " .. lineParser.lineNum .. ", pos " .. lineParser.pos)
+      end
+      if label and ctx.relAddr then
+        return label - ctx.relAddr
+      end
+      return label or 0
+    end
   else
     return parseNumber(lineParser)
   end
 end
 
-parseMath = function(lineParser, ctx)
+parseMath = function(lineParser)
   local values = {}
   local ops = {}
   local function applyOp()
     local op = table.remove(ops)
     local b = table.remove(values)
     local a = table.remove(values)
-    table.insert(values, operators[op].fn(a, b))
+    table.insert(values, { fn = operators[op].fn, a = a, b = b})
   end
-  table.insert(values, parseExpression(lineParser, ctx))
+  table.insert(values, parseExpression(lineParser))
   while true do
     lineParser:skipWhitespace()
     local op = lineParser:peek(1)
@@ -159,7 +175,7 @@ parseMath = function(lineParser, ctx)
       else break end
     end
     table.insert(ops, op)
-    table.insert(values, parseExpression(lineParser, ctx))
+    table.insert(values, parseExpression(lineParser))
   end
   while #ops > 0 do
     applyOp()
@@ -168,19 +184,12 @@ parseMath = function(lineParser, ctx)
 end
 
 
-local function parseAddress(lineParser, ctx)
+local function parseAddress(lineParser)
   lineParser:skipWhitespace()
   lineParser:expect("[")
-  local addr = parseMath(lineParser, ctx)
+  local addr = parseMath(lineParser)
   lineParser:expect("]")
-  if addr < 0 or addr > 2 ^ 31 then
-    error("Invalid address at line " .. lineParser.lineNum .. ", pos " .. lineParser.pos)
-  end
-  return
-    addr & 0xFF,
-    (addr >> 8) & 0xFF,
-    (addr >> 16) & 0xFF,
-    (addr >> 24) & 0xFF
+  return addr
 end
 
 local function parseComma(lineParser)
@@ -192,30 +201,53 @@ local function oprNone()
   return {}
 end
 
+local function oprImm(lineParser)
+  local imm = parseMath(lineParser)
+  return { imm = imm }
+end
+
 local function oprRegReg(lineParser)
   local reg1 = parseReg(lineParser)
   parseComma(lineParser)
   local reg2 = parseReg(lineParser)
-  return { (reg1 << 4) | reg2 }
+  return { regreg = (reg1 << 4) | reg2 }
 end
 
-local function oprRegImm(lineParser, ctx)
+local function oprRegImm(lineParser)
   local reg = parseReg(lineParser)
   parseComma(lineParser)
-  local imm = parseMath(lineParser, ctx)
-  return { reg << 4, imm }
+  local imm = parseMath(lineParser)
+  return {regreg = reg << 4, imm = imm }
 end
 
-local function oprRegAdr(lineParser)
+local function oprRegAddr(lineParser)
   local reg = parseReg(lineParser)
   parseComma(lineParser)
-  local a1, a2, a3, a4 = parseAddress(lineParser)
-  return { (reg << 4) | 0x0F, a1, a2, a3, a4 }
+  local addr = parseAddress(lineParser)
+  return { regreg = (reg << 4) | 0x0F, addr = addr }
+end
+
+local function oprAddrVReg(lineParser)
+  local addr = parseAddress(lineParser)
+  parseComma(lineParser)
+  local reg = parseReg(lineParser)
+  return { regreg = (reg << 4) | 0x0F, addr = addr }
+end
+
+local function oprAddr(lineParser)
+  local addr = parseMath(lineParser)
+  return { addr = addr }
 end
 
 local opcodes = {
   nop = { op = 0x00, operands = oprNone },
   hlt = { op = 0x03, operands = oprNone },
+  jmpr = { op = 0x20, operands = oprImm },
+  jer = { op = 0x22, operands = oprImm },
+  jner = { op = 0x23, operands = oprImm },
+  jl = { op = 0x24, operands = oprImm },
+  jler = { op = 0x25, operands = oprImm },
+  jmpa = { op = 0x40, operands = oprAddr },
   add = { op = 0x80, operands = oprRegReg },
   sub = { op = 0x81, operands = oprRegReg },
   mul = { op = 0x82, operands = oprRegReg },
@@ -226,56 +258,62 @@ local opcodes = {
   shl = { op = 0x88, operands = oprRegReg },
   shr = { op = 0x89, operands = oprRegReg },
   shra = { op = 0x8A, operands = oprRegReg },
-  mod = { op = 0x8C, operands = oprRegReg },
-  cpy = { op = 0x91, operands = oprRegReg },
-  cpyi = { op = 0xA2, operands = oprRegImm },
-  stoa = { op = 0xD0, operands = oprRegAdr },
-  loda = { op = 0xD1, operands = oprRegAdr },
+  --mod = { op = 0x8C, operands = oprRegReg },
+  cpy = { op = 0x90, operands = oprRegReg },
+  addi = { op = 0xA0, operands = oprRegImm },
+  subi = { op = 0xA1, operands = oprRegImm },
+  cpyi = { op = 0xB0, operands = oprRegImm },
+  stoa = { op = 0xD0, operands = oprAddrVReg },
+  loda = { op = 0xD1, operands = oprRegAddr },
 }
 
-local function maybeParseOpcode(lineParser, ctx)
+local function maybeParseOpcode(lineParser)
   lineParser:skipWhitespace()
   local opcodeStr = parseWord(lineParser, "[a-zA-Z]")
   lineParser:skipWhitespace()
   if opcodes[opcodeStr] then
     local opcode = opcodes[opcodeStr]
-    local operands = opcode.operands(lineParser, ctx)
-    return { opcode.op, table.unpack(operands) }
+    local virtOp = opcode.operands(lineParser)
+    virtOp.op = opcode.op
+    return { virtOp }
   end
 
   return opcodeStr
 end
 
 local psuedoOps = {
-  ["repeat"] = function(lineParser, ctx)
-    local times = parseMath(lineParser, ctx)
-    -- TODO: Should we make sure ctx has the correct relOffset?
-    local oneResult = maybeParseOpcode(lineParser, ctx)
+  ["repeat"] = function(lineParser)
+    local times = parseMath(lineParser)
+    local oneResult = maybeParseOpcode(lineParser)
     if not oneResult then
       error("Invalid repeat instruction at line " .. lineParser.lineNum .. ", pos " .. lineParser.pos)
     end
 
-    local result = {}
-    for i = 1, times do
-      for j = 1, #oneResult do
-        result[#result + 1] = oneResult[j]
-      end
-    end
-
-    return result
+    return {{
+      special = "repeat",
+      times = times,
+      virtOp = oneResult,
+    }}
   end
 }
 
-local function parseLine(line, lineNum, ctx)
+local function parseLine(line, lineNum)
   local lineParser = newLineParser(lineNum, line)
   lineParser:skipWhitespace()
   if lineParser:isEmpty() or lineParser:peek(1) == ";" then
     return {}
   end
 
-  local result = maybeParseOpcode(lineParser, ctx)
+  local result = maybeParseOpcode(lineParser)
+  if type(result) == "string" and lineParser:peek(1) == ":" then
+    lineParser:eat(1)
+    lineParser:skipWhitespace()
+    if lineParser:isEmpty() or lineParser:peek(1) == ";" then
+      return { { special = "label", label = result } }
+    end
+  end
   if type(result) == "string" and psuedoOps[result] then
-    result = psuedoOps[result](lineParser, ctx)
+    result = psuedoOps[result](lineParser)
   end
 
   if not result then
@@ -290,18 +328,98 @@ local function parseLine(line, lineNum, ctx)
   return result
 end
 
-local function assembleProgram(lines)
-  local ctx = { relOffset = 0 }
-
+local function parseInstructions(lines)
   local program = {}
   for lineNum, line in ipairs(lines) do
-    local bytes = parseLine(line, lineNum, ctx)
-    for _, byte in ipairs(bytes) do
-      program[#program + 1] = byte
-      ctx.relOffset = ctx.relOffset + 1
+    local virtOps = parseLine(line, lineNum)
+    for _, virtOp in ipairs(virtOps) do
+      program[#program + 1] = virtOp
     end
   end
   return program
+end
+
+local function evaluateExpression(expr, ctx)
+  if type(expr) == "number" then
+    return expr
+  elseif type(expr) == "function" then
+    return expr(ctx)
+  elseif type(expr) == "table" and expr.fn then
+    local a = evaluateExpression(expr.a, ctx)
+    local b = evaluateExpression(expr.b, ctx)
+    return expr.fn(a, b)
+  end
+  error("Invalid expression")
+end
+
+local function addAssembledBytes(assembled, virtOps, ctx)
+  for _, virtOp in ipairs(virtOps) do
+    if virtOp.special == "repeat" then
+      local times = evaluateExpression(virtOp.times, ctx)
+      for i = 1, times do
+        addAssembledBytes(assembled, virtOp.virtOp, ctx)
+      end
+    elseif virtOp.special == "label" then
+      ctx.labels[virtOp.label] = ctx.relOffset
+    elseif virtOp.op then
+      -- TODO: Bounds check evaluated values
+      local postRelOffset = ctx.relOffset + 1
+        + (virtOp.imm and 1 or 0)
+        + (virtOp.regreg and 1 or 0)
+        + (virtOp.addr and 4 or 0)
+      assembled[#assembled + 1] = virtOp.op
+      if virtOp.imm then
+        local tCtx = setmetatable({ relAddr = postRelOffset }, { __index = ctx })
+        assembled[#assembled + 1] = evaluateExpression(virtOp.imm, tCtx) % 256
+      end
+      if virtOp.regreg then
+        assembled[#assembled + 1] = virtOp.regreg
+      end
+      if virtOp.addr then
+        local addr = evaluateExpression(virtOp.addr, ctx)
+        assembled[#assembled + 1] = addr & 0xFF
+        assembled[#assembled + 1] = (addr >> 8) & 0xFF
+        assembled[#assembled + 1] = (addr >> 16) & 0xFF
+        assembled[#assembled + 1] = (addr >> 24) & 0xFF
+      end
+      ctx.relOffset = postRelOffset
+    else
+      error("Encountered unknown instruction")
+    end
+  end
+end
+
+local function resetCtx(ctx)
+  ctx.relOffset = 0
+  ctx.firstParse = false
+end
+
+local function bytesEqual(a, b)
+  if #a ~= #b then return false end
+  for i = 1, #a do
+    if a[i] ~= b[i] then return false end
+  end
+  return true
+end
+
+local function assembleProgram(lines)
+  local ctx = {
+    relOffset = 0,
+    firstParse = true,
+    labels = {}
+  }
+  local virtOps = parseInstructions(lines)
+  local assembled, prevAssembled = {}, {}
+  addAssembledBytes(assembled, virtOps, ctx)
+  resetCtx(ctx)
+  while not bytesEqual(assembled, prevAssembled) do
+    prevAssembled = assembled
+    assembled = {}
+    addAssembledBytes(assembled, virtOps, ctx)
+    resetCtx(ctx)
+  end
+
+  return assembled
 end
 
 local function saveProgram(program, format, outputFile)
