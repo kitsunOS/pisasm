@@ -92,9 +92,20 @@ local function parseRegexNumber(lineParser, regex, requireDigit, base)
   return tonumber(numStr, base or 10) or 0
 end
 
+local function parseCharNumber(lineParser)
+  lineParser:skipWhitespace()
+  lineParser:expect("'")
+  local char = lineParser:eat(1)
+  lineParser:expect("'")
+  return string.byte(char)
+end
+
 local function parseNumber(lineParser)
   lineParser:skipWhitespace()
   local multiplier = 1
+  if lineParser:peek(1) == "'" then
+    return parseCharNumber(lineParser)
+  end
   if lineParser:peek(1) == "-" then
     multiplier = -1
     lineParser:eat(1)
@@ -183,6 +194,20 @@ parseMath = function(lineParser)
   return values[1]
 end
 
+local function parseString(lineParser)
+  lineParser:skipWhitespace()
+  lineParser:expect('"')
+  local str = ""
+  while lineParser.pos <= #lineParser.line and lineParser:peek(1) ~= '"' do
+    str = str .. lineParser:eat(1)
+  end
+  lineParser:expect('"')
+  return str
+end
+
+local function isString(lineParser)
+  return lineParser:peek(1) == '"'
+end
 
 local function parseAddress(lineParser)
   lineParser:skipWhitespace()
@@ -210,6 +235,28 @@ local function oprRegReg(lineParser)
   local reg1 = parseReg(lineParser)
   parseComma(lineParser)
   local reg2 = parseReg(lineParser)
+  return { regreg = (reg1 << 4) | reg2 }
+end
+
+local function oprRegAReg(lineParser)
+  local reg1 = parseReg(lineParser)
+  parseComma(lineParser)
+  lineParser:skipWhitespace()
+  lineParser:expect("[")
+  local reg2 = parseReg(lineParser)
+  lineParser:skipWhitespace()
+  lineParser:expect("]")
+  return { regreg = (reg1 << 4) | reg2 }
+end
+
+local function oprARegReg(lineParser)
+  lineParser:skipWhitespace()
+  lineParser:expect("[")
+  local reg2 = parseReg(lineParser)
+  lineParser:skipWhitespace()
+  lineParser:expect("]")
+  parseComma(lineParser)
+  local reg1 = parseReg(lineParser)
   return { regreg = (reg1 << 4) | reg2 }
 end
 
@@ -242,11 +289,7 @@ end
 local opcodes = {
   nop = { op = 0x00, operands = oprNone },
   hlt = { op = 0x03, operands = oprNone },
-  jmpr = { op = 0x20, operands = oprImm },
-  jer = { op = 0x22, operands = oprImm },
-  jner = { op = 0x23, operands = oprImm },
-  jl = { op = 0x24, operands = oprImm },
-  jler = { op = 0x25, operands = oprImm },
+  jmpr = { op = 0x30, operands = oprImm, rel = true },
   jmpa = { op = 0x40, operands = oprAddr },
   add = { op = 0x80, operands = oprRegReg },
   sub = { op = 0x81, operands = oprRegReg },
@@ -260,9 +303,15 @@ local opcodes = {
   shra = { op = 0x8A, operands = oprRegReg },
   --mod = { op = 0x8C, operands = oprRegReg },
   cpy = { op = 0x90, operands = oprRegReg },
+  stoar = { op = 0x94, operands = oprARegReg },
+  lodar = { op = 0x95, operands = oprRegAReg },
   addi = { op = 0xA0, operands = oprRegImm },
   subi = { op = 0xA1, operands = oprRegImm },
   cpyi = { op = 0xB0, operands = oprRegImm },
+  jer = { op = 0xB2, operands = oprRegImm, rel = true },
+  jner = { op = 0xB3, operands = oprRegImm, rel = true },
+  jlr = { op = 0xB4, operands = oprRegImm, rel = true },
+  jler = { op = 0xB5, operands = oprRegImm, rel = true },
   stoa = { op = 0xD0, operands = oprAddrVReg },
   loda = { op = 0xD1, operands = oprRegAddr },
 }
@@ -275,6 +324,7 @@ local function maybeParseOpcode(lineParser)
     local opcode = opcodes[opcodeStr]
     local virtOp = opcode.operands(lineParser)
     virtOp.op = opcode.op
+    virtOp.rel = opcode.rel
     return { virtOp }
   end
 
@@ -294,14 +344,105 @@ local psuedoOps = {
       times = times,
       virtOp = oneResult,
     }}
+  end,
+  ["db"] = function(lineParser)
+    local values = {}
+    while true do
+      lineParser:skipWhitespace()
+      if lineParser:isEmpty() or lineParser:peek(1) == ";" then break end
+      if isString(lineParser) then
+        values[#values + 1] = parseString(lineParser)
+      else
+        local value = parseMath(lineParser)
+        values[#values + 1] = value
+      end
+      lineParser:skipWhitespace()
+      if lineParser:peek(1) == "," then
+        lineParser:eat(1)
+      else
+        break
+      end
+    end
+    return { { special = "db", values = values } }
   end
 }
+
+local SMODE_TYPES = {
+  ["u8"] = { extend = false, datasize = 0 },
+  ["u16"] = { extend = false, datasize = 1 },
+  ["u32"] = { extend = false, datasize = 2 },
+  ["s8"] = { extend = true, datasize = 0 },
+  ["s16"] = { extend = true, datasize = 1 },
+  ["s32"] = { extend = true, datasize = 2 },
+  ["uMax"] = { extend = false, datasize = 3 },
+  ["sMax"] = { extend = true, datasize = 3 },
+}
+
+local function parseSmode(lineParser)
+  local smode = {}
+  lineParser:expect("(")
+  lineParser:skipWhitespace()
+  if lineParser:peek(2) == "r." then
+    lineParser:eat(2)
+    local type = parseWord(lineParser, "[a-zA-Z0-9]")
+    local stype = SMODE_TYPES[type]
+    if not stype then
+      error("Invalid smode register mode at line " .. lineParser.lineNum .. ", pos " .. lineParser.pos)
+    end
+    smode.extend = stype.extend
+    smode.regsize = stype.datasize
+    lineParser:skipWhitespace()
+    if not (lineParser:peek(1) == "," or lineParser:peek(1) == ")") then
+      error("Expected ',' or ')' at line " .. lineParser.lineNum .. ", pos " .. lineParser.pos)
+    end
+    if lineParser:peek(1) == "," then
+      lineParser:eat(1)
+      lineParser:skipWhitespace()
+      if lineParser:peek(1) == ")" then
+        error("Expected another value after comma at line " .. lineParser.lineNum .. ", pos " .. lineParser.pos)
+      end
+    end
+  end
+  if lineParser:peek(2) == "i." then
+    lineParser:eat(2)
+    local type = parseWord(lineParser, "[a-zA-Z0-9]")
+    local stype = SMODE_TYPES[type]
+    if not stype then
+      error("Invalid smode immediate mode at line " .. lineParser.lineNum .. ", pos " .. lineParser.pos)
+    end
+    if stype.datasize == 3 then
+      error("Invalid smode immediate mode at line " .. lineParser.lineNum .. ", pos " .. lineParser.pos)
+    end
+    if smode.extend ~= nil and stype.extend ~= smode.extend then
+      error("Inconsistent smode types at line " .. lineParser.lineNum .. ", pos " .. lineParser.pos)
+    end
+    smode.extend = stype.extend
+    smode.immsize = stype.datasize
+    lineParser:skipWhitespace()
+  end
+
+  lineParser:expect(")")
+  if not (smode.regsize or smode.immsize) then
+    error("Invalid smode at line " .. lineParser.lineNum .. ", pos " .. lineParser.pos)
+  end
+
+  smode.regsize = smode.regsize or 3
+  smode.immsize = smode.immsize or 0
+
+  return smode
+end
 
 local function parseLine(line, lineNum)
   local lineParser = newLineParser(lineNum, line)
   lineParser:skipWhitespace()
   if lineParser:isEmpty() or lineParser:peek(1) == ";" then
     return {}
+  end
+
+  local smode
+  if lineParser:peek(1) == "(" then
+    smode = parseSmode(lineParser)
+    lineParser:skipWhitespace()
   end
 
   local result = maybeParseOpcode(lineParser)
@@ -323,6 +464,10 @@ local function parseLine(line, lineNum)
   lineParser:skipWhitespace()
   if not (lineParser:isEmpty() or lineParser:peek(1) == ";") or type(result) ~= "table" then
     error("Unexpected token at line " .. lineNum .. ", pos " .. lineParser.pos)
+  end
+
+  for _, virtOp in ipairs(result) do
+    virtOp.smode = smode
   end
 
   return result
@@ -352,28 +497,66 @@ local function evaluateExpression(expr, ctx)
   error("Invalid expression")
 end
 
-local function addAssembledBytes(assembled, virtOps, ctx)
-  for _, virtOp in ipairs(virtOps) do
-    if virtOp.special == "repeat" then
-      local times = evaluateExpression(virtOp.times, ctx)
-      for i = 1, times do
-        addAssembledBytes(assembled, virtOp.virtOp, ctx)
+local addAssembledBytes
+local specials = {
+  ["repeat"] = function(ctx, virtOp, assembled)
+    local times = evaluateExpression(virtOp.times, ctx)
+    for i = 1, times do
+      addAssembledBytes(assembled, virtOp.virtOp, ctx)
+    end
+  end,
+  ["label"] = function(ctx, virtOp)
+    ctx.labels[virtOp.label] = ctx.relOffset
+  end,
+  ["db"] = function(ctx, virtOp, assembled)
+    for _, value in ipairs(virtOp.values) do
+      if type(value) == "string" then
+        for i = 1, #value do
+          assembled[#assembled + 1] = string.byte(value:sub(i, i))
+        end
+        ctx.relOffset = ctx.relOffset + #value
+      else
+        assembled[#assembled + 1] = evaluateExpression(value, ctx) % 256
+        ctx.relOffset = ctx.relOffset + 1
       end
-    elseif virtOp.special == "label" then
-      ctx.labels[virtOp.label] = ctx.relOffset
+    end
+  end
+}
+
+addAssembledBytes = function(assembled, virtOps, ctx)
+  for _, virtOp in ipairs(virtOps) do
+    if virtOp.special then
+      if specials[virtOp.special] then
+        specials[virtOp.special](ctx, virtOp, assembled)
+      else
+        error("Unknown special operation: " .. virtOp.special)
+      end
     elseif virtOp.op then
       -- TODO: Bounds check evaluated values
+      local sizes = { [0] = 1, 2, 4, 4 }
+      local immSize = sizes[virtOp.smode and virtOp.smode.immsize or 0]
       local postRelOffset = ctx.relOffset + 1
-        + (virtOp.imm and 1 or 0)
+        + (virtOp.smode and 2 or 0)
         + (virtOp.regreg and 1 or 0)
+        + (virtOp.imm and immSize or 0)
         + (virtOp.addr and 4 or 0)
-      assembled[#assembled + 1] = virtOp.op
-      if virtOp.imm then
-        local tCtx = setmetatable({ relAddr = postRelOffset }, { __index = ctx })
-        assembled[#assembled + 1] = evaluateExpression(virtOp.imm, tCtx) % 256
+
+      if virtOp.smode then
+        local smode = virtOp.smode
+        assembled[#assembled + 1] = 0xE0
+        assembled[#assembled + 1] = (smode.extend and 0x80 or 0) | (smode.regsize << 2) | (smode.immsize)
       end
+
+      assembled[#assembled + 1] = virtOp.op
       if virtOp.regreg then
         assembled[#assembled + 1] = virtOp.regreg
+      end
+      if virtOp.imm then
+        local tCtx = setmetatable({ relAddr = virtOp.rel and postRelOffset }, { __index = ctx })
+        local result = evaluateExpression(virtOp.imm, tCtx)
+        for i = 0, immSize - 1 do
+          assembled[#assembled + 1] = (result >> (i * 8)) & 0xFF
+        end
       end
       if virtOp.addr then
         local addr = evaluateExpression(virtOp.addr, ctx)
